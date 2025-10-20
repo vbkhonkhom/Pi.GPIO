@@ -31,7 +31,7 @@ from simple_sort import Sort  # ใช้ SORT แบบ pure-Python
 # ===================== CONFIG =====================
 TARGET_FPS = 10
 RTSP_URL = "rtsp://Project:Project1234@10.44.63.127/stream1"
-USE_TCP = True
+USE_TCP = True 
 YOLO_WEIGHTS = "best.pt"
 YOLO_CONF = 0.5
 INTEREST_LABELS = {"centipede", "lizard", "mouse", "snake"}
@@ -44,7 +44,7 @@ THAI_TRANSLATIONS = {
 }
 
 DETECT_EVERY_N_FRAMES = 2
-USE_PYAV = True
+USE_PYAV = True # ใช้ไลบรารี PyAV ในการอ่าน RTSP (ให้ timestamp ที่แม่นยำกว่า)
 TIMESTAMP_OFFSET_SECONDS = 0.0
 LOCAL_TZ = ZoneInfo("Asia/Bangkok")
 SHOW_WINDOW = True
@@ -53,12 +53,12 @@ MAX_SD_MB = 300
 MAX_SD_FILES = 2000
 
 
-TRACK_MAX_AGE = 15
-TRACK_MIN_HITS = 2
-TRACK_IOU_THRESH = 0.2
+TRACK_MAX_AGE = 15 # จำนวนเฟรมสูงสุดที่ tracker จะยังจำ object ที่หายไปได้
+TRACK_MIN_HITS = 2 # จำนวนครั้งขั้นต่ำที่ต้องเจอ object ก่อนจะเริ่ม track
+TRACK_IOU_THRESH = 0.2 # ค่า IoU threshold สำหรับการจับคู่ object เดิม
 
 # เวลา timeout (วินาที)
-OPEN_TIMEOUT = 8.0         # timeout ตอน "เปิด RTSP" (constructor)
+OPEN_TIMEOUT = 8.0         # timeout ตอน "เปิด RTSP"
 FIRST_FRAME_TIMEOUT = 8.0  # timeout ตอนรอ "เฟรมแรก"
 
 cloudinary.config(
@@ -147,6 +147,7 @@ def has_internet(timeout: float = 1.5) -> bool:
 # ===== Save helpers =====
 _cached_windows_sd_dir = None
 
+# ฟังก์ชันสำหรับลบไฟล์เก่าทิ้งเมื่อพื้นเต็มที่หรือจำนวนไฟล์เกินกำหนด
 def _prune_if_needed(dest_dir):
     try:
         files=[]
@@ -154,18 +155,25 @@ def _prune_if_needed(dest_dir):
             fp=os.path.join(dest_dir,name)
             if os.path.isfile(fp): files.append((fp, os.path.getmtime(fp), os.path.getsize(fp)))
         files.sort(key=lambda x:x[1])
+
+        # ลบไฟล์ที่เก่าที่สุดออก ถ้าจำนวนไฟล์เกินกำหนด
         while len(files)>MAX_SD_FILES:
             fp,*_=files.pop(0)
             try: os.remove(fp); print(f"[PRUNE] by count: {fp}")
             except Exception as e: print(f"[PRUNE] remove failed: {fp} -> {e}")
         size_mb=sum(sz for _,__,sz in files)/(1024*1024)
+
+        # ลบไฟล์ที่เก่าที่สุดออก ถ้าขนาดพื้นที่เกินกำหนด
         while size_mb>MAX_SD_MB and files:
             fp,_,sz=files.pop(0)
             try: os.remove(fp); size_mb-=sz/(1024*1024); print(f"[PRUNE] by size: {fp}")
             except Exception as e: print(f"[PRUNE] remove failed: {fp} -> {e}")
     except Exception as e:
         print(f"[PRUNE] error: {e}")
-
+        
+# ฟังก์ชันหาตำแหน่งที่จะบันทึกไฟล์ภาพ
+# จะพยายามใช้ SD Card ที่เสียบอยู่ (สำหรับ Raspberry Pi) ก่อน
+# หากไม่เจอ จะใช้โฟลเดอร์ในเครื่องแทน
 def get_windows_sd_dir():
     global _cached_windows_sd_dir
     if _cached_windows_sd_dir: return _cached_windows_sd_dir
@@ -230,7 +238,7 @@ else:
     new_doc_ref.set({"ip":ip_address,"id":new_doc_ref.id,"createdAt":firestore.SERVER_TIMESTAMP})
     pi_doc_ref = new_doc_ref
 
-# ===== FCM v1 =====
+# ===== FCM v1 (ฟังก์ชันสำหรับส่ง Push Notification ไปยังมือถือ) =====
 def send_fcm_v1_notification(title, body, topic):
     if not topic:
         print("[FCM] No topic provided, skipping notification.")
@@ -292,7 +300,8 @@ def threaded_upload(image_path, detections_list, captured_ts):
                 device_data = device_doc.to_dict()
                 owner_id = device_data.get("ownerId")
                 status = device_data.get("status")
-
+                
+                # จะส่ง notification ก็ต่อเมื่อมี ownerId และ status เป็น "online"
                 if owner_id and status == "online":
                     counts = defaultdict(int)
                     for det in detections_list:
@@ -302,7 +311,7 @@ def threaded_upload(image_path, detections_list, captured_ts):
                         thai_label = THAI_TRANSLATIONS.get(label, label.capitalize())
                         body_parts.append(f"{thai_label} {count} ตัว")
                     notification_body = "ตรวจพบ " + ", ".join(body_parts)
-                    notification_title = "ตรวจพบสิ่งเคลื่อนไหว"
+                    notification_title = "ตรวจพบสิ่งมีชีวิตไม่พึงประสงค์"
                     send_fcm_v1_notification(
                         title=notification_title,
                         body=notification_body,
@@ -343,18 +352,22 @@ class DetOverlay:
 
 det_overlay = DetOverlay(ttl=2.0)
 
-# ===== MoveGate =====
+# ===== MoveGate (กลไกกรองการแจ้งเตือนตาม 'การเคลื่อนที่') =====
+# วัตถุประสงค์: ป้องกันการส่งแจ้งเตือนซ้ำๆ สำหรับ object เดิมที่ขยับแค่นิดเดียว
+# หลักการทำงาน: จะส่งแจ้งเตือนครั้งแรกที่เจอ object และจะส่งอีกครั้งก็ต่อเมื่อ object นั้น
+# เคลื่อนที่ออกจากจุดที่ส่งแจ้งเตือนล่าสุดไปเป็นระยะทางที่กำหนด (move_thresh)
 def _norm_dist(p1,p2,w,h):
     dx=(p1[0]-p2[0])/w; dy=(p1[1]-p2[1])/h; return math.hypot(dx,dy)
 
 class MoveGate:
     def __init__(self, snap_thresh=0.03, move_thresh=0.12, track_timeout=3.0, hist_len=10):
-        self.snap_thresh=snap_thresh
-        self.move_thresh=move_thresh
-        self.track_timeout=track_timeout
+        self.snap_thresh=snap_thresh # ระยะที่จะถือว่าเป็น object ตัวเดิม
+        self.move_thresh=move_thresh # ระยะเคลื่อนที่ขั้นต่ำที่จะ trigger การส่งใหม่
+        self.track_timeout=track_timeout # เวลาที่ object หายไปแล้วจะไม่จำ
         self.tracks=defaultdict(list)
         self.hist_len = hist_len
     def _prune(self, now):
+        # ลบ track ที่เก่าเกินไป
         for label in list(self.tracks.keys()):
             self.tracks[label]=[t for t in self.tracks[label] if now-t["last_seen"]<=self.track_timeout]
             if not self.tracks[label]: del self.tracks[label]
@@ -391,7 +404,9 @@ class MoveGate:
 
 move_gate = MoveGate()
 
-# ===== AlertGate =====
+# ===== AlertGate (กลไกป้องกันการแจ้งเตือนซ้ำซ้อน 'ในพื้นที่และเวลาเดิม') =====
+# แบ่งภาพเป็นช่อง Grid และมี Cooldown สำหรับแต่ละช่อง
+# ป้องกันการแจ้งเตือนถี่ๆ เมื่อมีสัตว์ตัวเดิมวนเวียนอยู่ในบริเวณเดียวกัน
 class AlertGate:
     def __init__(self, grid=20, cooldown_stationary=120.0, cooldown_moving=30.0):
         self.grid = grid
@@ -432,8 +447,9 @@ class MedianLag:
     @property
     def value(self) -> float:
         return self._value
-
-# ===== RTSP Reader (PyAV preferred, OpenCV fallback) =====
+        
+# ===== RTSP Reader (Class หลักสำหรับอ่านสตรีมวิดีโอ) =====
+# *** จุดสำคัญ: อ่านเฟรมใน Thread แยก, พยายามต่อใหม่อัตโนมัติ, ใช้ PyAV เพื่อความแม่นยำ ***
 class RTSPReader:
     def __init__(self, url, use_tcp=True):
         self.url = url
@@ -459,7 +475,8 @@ class RTSPReader:
         else:
             self._open_cv()
             self.t = threading.Thread(target=self._loop_cv, daemon=True); self.t.start()
-
+            
+    # ส่วนของ PyAV จะมีการคำนวณ timestamp ที่ซับซ้อนกว่า แต่แม่นยำกว่า
     def _open_pyav(self):
         opts = {
             "rtsp_transport": "tcp" if self.use_tcp else "udp",
@@ -508,6 +525,7 @@ class RTSPReader:
                             self.frame_ts = (img, ts_corr)
                     if self.stopped: break
             except Exception as e:
+                # ถ้าหลุด จะพยายามต่อใหม่
                 print(f"[RTSP][PyAV] loop error: {e}")
                 time.sleep(0.5)
                 try:
@@ -517,7 +535,8 @@ class RTSPReader:
                     rgb.red()
                     print(f"[RTSP][PyAV] reopen failed: {e2}")
                     time.sleep(1)
-
+                    
+    # ส่วนของ OpenCV จะใช้ง่ายกว่า แต่ timestamp จะเป็นเวลาที่อ่านเฟรมได้ ไม่ใช่เวลาจริงของเฟรม
     def _open_cv(self):
         transport = "tcp" if self.use_tcp else "udp"
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
@@ -562,7 +581,8 @@ class RTSPReader:
             try: self.av_container.close()
             except: pass
 
-# --- helper เปิด RTSP แบบมี timeout ระดับ constructor ---
+# --- helper สำหรับเปิด RTSP แบบมี timeout ---
+# ป้องกันไม่ให้โปรแกรมค้าง ถ้าหากกล้องปิดอยู่หรือไม่สามารถเชื่อมต่อได้ตอนเริ่ม
 def _make_reader_with_timeout(url, use_tcp=True, timeout=OPEN_TIMEOUT):
     """พยายามสร้าง RTSPReader ภายในเวลาที่กำหนด -> (reader, err)"""
     q = queue.Queue(maxsize=1)
@@ -625,30 +645,40 @@ def run_detection_loop():
 
     last_detections_xyxy = np.empty((0, 5), dtype=float)
     last_labels = []
-
+    
+    #คำนวณค่า Intersection over Union (IoU) ระหว่าง bounding box สองกล่อง (a และ b)
+    #IoU เป็นตัวชี้วัดว่ากล่องสองใบซ้อนทับกันมากแค่ไหน
+    #- ค่าเข้าใกล้ 1 หมายถึงซ้อนทับกันสนิท
+    #- ค่าเป็น 0 หมายถึงไม่ซ้อนทับกันเลย
     def iou(a, b):
+        # ดึงค่าพิกัด (มุมซ้ายบน และ มุมขวาล่าง) ของกล่อง a และ b
+        # (x1, y1) คือพิกัดมุมบนซ้าย, (x2, y2) คือพิกัดมุมล่างขวา
         ax1, ay1, ax2, ay2 = a
         bx1, by1, bx2, by2 = b
+        #1. คำนวณหาพื้นที่ส่วนที่ซ้อนทับกัน (Intersection) ---
         inter_x1, inter_y1 = max(ax1, bx1), max(ay1, by1)
         inter_x2, inter_y2 = min(ax2, bx2), min(ay2, by2)
         iw, ih = max(0, inter_x2 - inter_x1), max(0, inter_y2 - inter_y1)
         inter = iw * ih
+        # --- 2. คำนวณหาพื้นที่ของทั้งสองกล่องรวมกัน (Union) ---
         area_a = max(0, ax2-ax1) * max(0, ay2-ay1)
         area_b = max(0, bx2-bx1) * max(0, by2-by1)
         union = area_a + area_b - inter + 1e-6
         return inter / union
 
     while not _STOP.is_set():
+        #อ่านเฟรมล่าสุดจาก Reader
         item = reader.read()
         if item is None:
             time.sleep(0.01); continue
 
         frame, frame_ts = item
         h, w = frame.shape[:2]
-
+        #ตัดสินใจว่าจะทำ detection ในเฟรมนี้หรือไม่ (ตามค่า DETECT_EVERY_N_FRAMES)
         do_detect = (frame_idx % DETECT_EVERY_N_FRAMES == 0)
 
         if do_detect:
+            #ส่งเฟรมเข้าโมเดล YOLO เพื่อหา object
             try:
                 results = model.predict(source=frame, conf=YOLO_CONF, verbose=False, imgsz=1280)
                 boxes = results[0].boxes
@@ -673,7 +703,7 @@ def run_detection_loop():
             else:
                 last_detections_xyxy = np.empty((0,5), dtype=float)
                 last_labels = []
-
+        #ส่งผลลัพธ์ (ไม่ว่าจะมาจากเฟรมปัจจุบันหรือเฟรมก่อนหน้า) เข้า SORT Tracker
         tracker.max_age = TRACK_MAX_AGE
         tracker.min_hits = TRACK_MIN_HITS
         tracker.iou_threshold = TRACK_IOU_THRESH
@@ -687,6 +717,7 @@ def run_detection_loop():
         det_boxes = [d[:4] for d in last_detections_xyxy.tolist()]
         det_confs = [d[4] for d in last_detections_xyxy.tolist()]
 
+        # ฟังก์ชันหาค่า IOU (Intersection over Union) เพื่อจับคู่ track กับ detection
         def _iou(a, b):
             ax1, ay1, ax2, ay2 = a
             bx1, by1, bx2, by2 = b
@@ -698,23 +729,25 @@ def run_detection_loop():
             area_b = max(0, bx2-bx1) * max(0, by2-by1)
             union = area_a + area_b - inter + 1e-6
             return inter / union
-
+        #วนลูปผลลัพธ์จาก Tracker
         for t in tracks:
             x1, y1, x2, y2, tid = t.tolist()
             label = "object"; conf = 0.0
+            #จับคู่ Track ID กับ Label/Conf จาก YOLO โดยใช้ค่า IoU ที่ดีที่สุด
             if det_boxes:
                 ious = [_iou([x1,y1,x2,y2], db) for db in det_boxes]
                 j = int(np.argmax(ious)) if len(ious) else -1
                 if j >= 0 and ious[j] > 0.1:
                     label = last_labels[j] if j < len(last_labels) else "object"
                     conf = float(det_confs[j] if j < len(det_confs) else 0.0)
-
+            # เตรียมข้อมูลสำหรับวาดกรอบ
             overlay_dets.append({
                 "x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2),
                 "label": label, "conf": conf, "track_id": int(tid),
             })
             found_labels_txt.append(f"{label}#{int(tid)} ({conf:.2f})")
 
+            #ถ้าเป็น object ที่เราสนใจ (และเป็นเฟรมที่ทำ detection) ให้ส่งเข้า Gate
             if do_detect and label in INTEREST_LABELS:
                 cx = (x1 + x2) / 2.0
                 cy = (y1 + y2) / 2.0
@@ -735,7 +768,7 @@ def run_detection_loop():
                     "track_id": int(tid),
                     "is_stationary": is_stationary, "moved_norm": moved_norm
                 })
-
+        #วาดผลลัพธ์ทั้งหมดลงบนเฟรม
         det_overlay.update(overlay_dets)
         det_overlay.draw(frame)
 
@@ -743,14 +776,15 @@ def run_detection_loop():
             cv2.imshow("RTSP Stream + SORT tracking (10 fps)", frame)
             key=cv2.waitKey(1) & 0xFF
             if key==ord('q'): break
-
+        #ถ้ามี object ที่น่าสนใจ (ผ่าน Gate) ให้ทำการบันทึกและอัปโหลด
         if interesting_to_send:
             all_visible_interesting_objects = [
                 det for det in overlay_dets if det.get("label") in INTEREST_LABELS
             ]
             if not all_visible_interesting_objects:
                 all_visible_interesting_objects = interesting_to_send
-
+                
+            # สร้างชื่อไฟล์และ path
             dest_dir = get_windows_sd_dir()
             try: os.makedirs(dest_dir, exist_ok=True)
             except Exception: pass
@@ -759,7 +793,8 @@ def run_detection_loop():
             labels_summary = "-".join(sorted(list(set(p['label'] for p in all_visible_interesting_objects))))
             fname = f"detect_{stamp.strftime('%Y%m%d_%H%M%S')}_{labels_summary}_{uuid.uuid4().hex[:4]}.jpg"
             filename = os.path.join(dest_dir, fname)
-
+            
+            # บันทึกไฟล์ภาพ
             try:
                 ok, enc = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
                 if ok:
